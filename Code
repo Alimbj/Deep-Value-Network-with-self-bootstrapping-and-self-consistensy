@@ -1,0 +1,328 @@
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+# ===================== ENV =====================
+
+
+class PancakeEnv:
+    def __init__(self, n=10, device="cpu"):
+        import importlib
+
+        cay = importlib.import_module("cayleypy")
+
+        self.n = n
+        self.device = torch.device(device)
+        self.goal = torch.arange(n, dtype=torch.long, device=self.device)
+        self.action_size = n - 1
+
+        self.graph = cay.CayleyGraph(
+            cay.PermutationGroups.pancake(n),
+            dtype=torch.int8,
+            device=("cuda" if self.device.type == "cuda" else "cpu"),
+        )
+
+    def apply_all_actions(self, states: torch.Tensor) -> torch.Tensor:
+        """
+        states: [B, n]
+        return: [A, B, n], where A = action_size
+        """
+        all_next = []
+        for a in range(self.action_size):
+            ns = self.graph.apply_path(states, [a])
+            if ns.dim() > 2:
+                ns = ns.squeeze(1)
+            all_next.append(ns.long())
+        return torch.stack(all_next, dim=0)
+
+    def random_walk_many(self, batch_size: int, max_steps: int) -> torch.Tensor:
+        """
+        Быстрая генерация батча random-walk состояний за счет пакетных переходов.
+        Каждый элемент получает свою случайную длину и случайные действия.
+        """
+        states = self.goal.unsqueeze(0).repeat(batch_size, 1)
+        walk_lens = torch.randint(1, max_steps + 1, (batch_size,), device=self.device)
+
+        for t in range(max_steps):
+            active = walk_lens > t
+            if not torch.any(active):
+                break
+
+            idx = torch.where(active)[0]
+            # случайные действия только для активных
+            acts = torch.randint(0, self.action_size, (idx.numel(),), device=self.device)
+            active_states = states[idx]
+
+            # считаем все действия одним вызовом, затем выбираем нужное
+            all_next = self.apply_all_actions(active_states)  # [A, B_active, n]
+            picked = all_next[acts, torch.arange(idx.numel(), device=self.device)]
+            states[idx] = picked
+
+        return states.long()
+
+    @torch.inference_mode()
+    def v_guided_walk_many(self, vnet, steps=10, width=16, out_count=32):
+        """
+        Векторизованный v-guided sampling:
+        - поддерживает несколько beam'ов сразу (out_count)
+        - использует один большой forward вместо тысяч мелких
+        """
+        states = self.goal.unsqueeze(0).repeat(out_count * width, 1)
+
+        for _ in range(steps):
+            all_next = self.apply_all_actions(states)  # [A, B, n]
+            A, B, n = all_next.shape
+
+            flat = all_next.reshape(A * B, n)
+            values = vnet(flat).reshape(A, B)
+
+            # Для каждого beam-слота выбираем лучший action
+            best_actions = torch.topk(values, k=1, dim=0).indices.squeeze(0)  # [B]
+            next_states = all_next[best_actions, torch.arange(B, device=self.device)]
+
+            # Перешафлим, чтобы beams не схлопывались детерминированно
+            perm = torch.randperm(B, device=self.device)
+            states = next_states[perm]
+
+        # выбрать out_count случайных из pool
+        pick = torch.randint(0, states.shape[0], (out_count,), device=self.device)
+        return states[pick].long()
+
+
+# ===================== MODEL =====================
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, dim)
+        self.fc2 = nn.Linear(dim, dim)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        h = F.gelu(self.norm1(self.fc1(x)))
+        h = self.norm2(self.fc2(h))
+        return F.gelu(x + h)
+
+
+class PermEncoder(nn.Module):
+    def __init__(self, n, token_dim=32, hidden=512, blocks=4):
+        super().__init__()
+        self.emb = nn.Embedding(n, token_dim)
+        self.pos = nn.Parameter(torch.randn(1, n, token_dim) * 0.02)
+        self.proj = nn.Linear(n * token_dim, hidden)
+        self.norm = nn.LayerNorm(hidden)
+        self.blocks = nn.ModuleList([ResidualBlock(hidden) for _ in range(blocks)])
+
+    def forward(self, s):
+        x = self.emb(s) + self.pos
+        x = x.reshape(x.shape[0], -1)
+        x = F.gelu(self.norm(self.proj(x)))
+        for b in self.blocks:
+            x = b(x)
+        return x
+
+
+class VNet(nn.Module):
+    def __init__(self, n):
+        super().__init__()
+        self.enc = PermEncoder(n)
+        self.head = nn.Linear(512, 1)
+
+    def forward(self, s):
+        return self.head(self.enc(s)).squeeze(-1)
+
+
+# ===================== BUFFER =====================
+
+
+class StateBuffer:
+    def __init__(self, capacity, n, device):
+        self.capacity = capacity
+        self.device = device
+        self.ptr = 0
+        self.size = 0
+        self.states = torch.empty((capacity, n), dtype=torch.long, device=device)
+
+    def push_many(self, s: torch.Tensor):
+        cnt = s.shape[0]
+        if cnt >= self.capacity:
+            self.states[:] = s[-self.capacity :]
+            self.ptr = 0
+            self.size = self.capacity
+            return
+
+        end = self.ptr + cnt
+        if end <= self.capacity:
+            self.states[self.ptr : end] = s
+        else:
+            split = self.capacity - self.ptr
+            self.states[self.ptr :] = s[:split]
+            self.states[: cnt - split] = s[split:]
+
+        self.ptr = end % self.capacity
+        self.size = min(self.size + cnt, self.capacity)
+
+    def sample(self, batch_size):
+        idx = torch.randint(0, self.size, (batch_size,), device=self.device)
+        return self.states[idx]
+
+
+# ===================== TRAIN =====================
+
+
+@torch.inference_mode()
+def compute_metrics(env, vnet, states):
+    all_next = env.apply_all_actions(states)
+    A, B, n = all_next.shape
+
+    flat = all_next.reshape(A * B, n)
+    v_next = vnet(flat).reshape(A, B)
+
+    v = vnet(states)
+    bellman_target = 1 + torch.min(v_next, dim=0).values
+
+    bellman_error = torch.abs(v - bellman_target).mean().item()
+    monotonic = (v.unsqueeze(0) > v_next).any(dim=0).float().mean().item()
+    value_std = torch.std(v).item()
+    return bellman_error, monotonic, value_std
+
+
+def train_v_step(env, v_main, v_target, optimizer, buffer, batch_size=512):
+    if buffer.size < batch_size:
+        return None
+
+    s = buffer.sample(batch_size)
+
+    with torch.no_grad():
+        all_next = env.apply_all_actions(s)
+        A, B, n = all_next.shape
+
+        flat = all_next.reshape(A * B, n)
+        v_next = v_target(flat).reshape(A, B)
+
+        target = 1 + torch.min(v_next, dim=0).values
+
+        is_goal = torch.all(s == env.goal.unsqueeze(0), dim=1)
+        target[is_goal] = 0.0
+
+    pred = v_main(s)
+    loss = F.mse_loss(pred, target)
+
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(v_main.parameters(), 1.0)
+    optimizer.step()
+
+    return loss.item()
+
+
+# ===================== SAMPLING =====================
+
+
+def generate_states(env, buffer, v_target, step, use_v_guided, curriculum_max, per_step=32):
+    max_steps = min(curriculum_max, 1 + step // 5000)
+
+    # Часть батча random-walk, часть v-guided
+    if not use_v_guided:
+        rw_count = per_step
+        vg_count = 0
+    else:
+        rw_count = int(per_step * 0.7)
+        vg_count = per_step - rw_count
+
+    if rw_count > 0:
+        rw = env.random_walk_many(rw_count, max_steps)
+        buffer.push_many(rw)
+
+    if vg_count > 0:
+        vg = env.v_guided_walk_many(v_target, steps=max_steps, width=8, out_count=vg_count)
+        buffer.push_many(vg)
+
+
+# ===================== SOLVER =====================
+
+
+@torch.inference_mode()
+def solve(env, vnet, start, max_steps=100):
+    s = start.clone()
+    path = []
+
+    for _ in range(max_steps):
+        if torch.equal(s, env.goal):
+            return True, path
+
+        candidates = env.apply_all_actions(s.unsqueeze(0)).squeeze(1)  # [A, n]
+        values = vnet(candidates)
+
+        best = torch.argmin(values).item()
+        s = candidates[best]
+        path.append(best)
+
+    return False, path
+
+
+# ===================== MAIN =====================
+
+
+def main():
+    set_seed(42)
+    torch.backends.cudnn.benchmark = True
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    env = PancakeEnv(n=20, device=device)
+
+    v_main = VNet(env.n).to(device)
+    v_target = VNet(env.n).to(device)
+    v_target.load_state_dict(v_main.state_dict())
+    v_target.eval()
+
+    optimizer = torch.optim.Adam(v_main.parameters(), lr=1e-4)
+
+    buffer = StateBuffer(200_000, env.n, device)
+
+    curriculum_max = 40
+    use_v_guided = False
+
+    for step in range(300_000):
+        generate_states(env, buffer, v_target, step, use_v_guided, curriculum_max)
+
+        loss = train_v_step(env, v_main, v_target, optimizer, buffer)
+
+        # update target network
+        if step % 2000 == 0:
+            v_target.load_state_dict(v_main.state_dict())
+
+        # compute metrics
+        if buffer.size > 1024 and step % 1000 == 0:
+            sample = buffer.sample(512)
+            bellman_error, monotonicity, value_std = compute_metrics(env, v_main, sample)
+
+            print(
+                f"step={step} loss={loss:.4f} | bellman={bellman_error:.4f} "
+                f"mono={monotonicity:.2f} std={value_std:.2f}"
+            )
+
+            # enable v-guided sampling when model is reasonable
+            if bellman_error < 1.0 and monotonicity > 0.9 and value_std > 0.5:
+                use_v_guided = True
+
+    # test
+    s = env.random_walk_many(1, 25)[0]
+    success, path = solve(env, v_main, s)
+    print("Solved:", success, "steps:", len(path))
+
+
+if __name__ == "__main__":
+    main()
